@@ -4,12 +4,37 @@ import 'package:flutter/material.dart';
 import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart' as mapbox;
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await dotenv.load(fileName: ".env");
-  mapbox.MapboxOptions.setAccessToken(dotenv.env['sk.eyJ1IjoiYWtlZWwxMzg2NyIsImEiOiJjbWU3MGV2amowMnI1Mmpxc2hrMWl3cWQ1In0.EVoLhtLD76iQNrg4U--uCA'] ?? '');
+  try {
+    await dotenv.load(fileName: ".env");
+    final accessToken = dotenv.env['MAPBOX_ACCESS_TOKEN'];
+    if (accessToken == null || accessToken.isEmpty) {
+      throw Exception('Mapbox access token is missing or invalid in .env file');
+    }
+    mapbox.MapboxOptions.setAccessToken(accessToken);
+  } catch (e) {
+    debugPrint('Failed to initialize Mapbox: $e');
+    runApp(const ErrorApp(message: 'Failed to load Mapbox configuration'));
+    return;
+  }
   runApp(const MyApp());
+}
+
+class ErrorApp extends StatelessWidget {
+  final String message;
+  const ErrorApp({super.key, required this.message});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      home: Scaffold(
+        body: Center(child: Text(message)),
+      ),
+    );
+  }
 }
 
 class MyApp extends StatelessWidget {
@@ -213,6 +238,23 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
   Future<void> _initBluetooth() async {
     _centralManager = CentralManager();
     try {
+      // Request permissions
+      final permissions = await [
+        Permission.bluetooth,
+        Permission.bluetoothScan,
+        Permission.bluetoothConnect,
+        Permission.location,
+      ].request();
+
+      if (!permissions.values.every((status) => status.isGranted)) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Bluetooth and location permissions are required')),
+          );
+        }
+        return;
+      }
+
       final state = _centralManager!.state;
       if (state != BluetoothLowEnergyState.poweredOn) {
         if (mounted) {
@@ -350,27 +392,35 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
       final services = await _centralManager!.discoverGATT(peripheral);
       final service = services.firstWhere(
         (s) => s.uuid == _serviceUUID,
+        orElse: () => throw Exception('Service not found'),
       );
       final characteristic = service.characteristics.firstWhere(
         (c) => c.uuid == _rxUUID,
+        orElse: () => throw Exception('Characteristic not found'),
       );
 
       // Set up notifications
       await _centralManager!.setCharacteristicNotifyState(peripheral, characteristic, state: true);
       _notificationSubscription = _centralManager!.characteristicNotified.listen((GATTCharacteristicNotifiedEventArgs event) {
         if (event.characteristic.uuid == _rxUUID) {
-          String received = utf8.decode(event.value).trim();
-          var coords = received.split(",");
-          if (coords.length == 2) {
-            try {
-              setState(() {
-                _latitude = coords[0];
-                _longitude = coords[1];
-                _updateCamera();
-              });
-            } catch (e) {
-              debugPrint('Invalid GPS data: $e');
+          try {
+            String received = utf8.decode(event.value).trim();
+            var coords = received.split(",");
+            if (coords.length != 2) {
+              throw FormatException('Invalid GPS data format');
             }
+            final lat = double.parse(coords[0]);
+            final lng = double.parse(coords[1]);
+            if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+              throw RangeError('GPS coordinates out of valid range');
+            }
+            setState(() {
+              _latitude = coords[0];
+              _longitude = coords[1];
+              _updateCamera();
+            });
+          } catch (e) {
+            debugPrint('Invalid GPS data: $e');
           }
         }
       });
