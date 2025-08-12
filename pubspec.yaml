@@ -38,6 +38,7 @@ dependencies:
   bluetooth_low_energy: ^6.1.0
   flutter_dotenv: ^5.2.1
   permission_handler: ^12.0.1
+  location: ^8.0.1
 
 
 dev_dependencies:

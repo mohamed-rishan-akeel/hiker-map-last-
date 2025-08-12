@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart' as mapbox;
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:location/location.dart' as loc; // Add to pubspec.yaml: location: ^5.0.3
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -210,29 +212,39 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
   mapbox.MapboxMap? _mapboxMap;
   mapbox.CircleAnnotationManager? _annotationManager;
   mapbox.CircleAnnotation? _locationAnnotation;
+  mapbox.PolylineAnnotationManager? _polylineManager;
+  mapbox.PolylineAnnotation? _pathAnnotation;
   CentralManager? _centralManager;
   Peripheral? _connectedPeripheral;
-  String _latitude = "0.0";
-  String _longitude = "0.0";
-  Timer? _timer;
+  loc.Location? _locationService;
+  StreamSubscription<loc.LocationData>? _locationSubscription;
+  double _latitude = 0.0;
+  double _longitude = 0.0;
+  double _prevLat = 0.0;
+  double _prevLng = 0.0;
+  List<mapbox.Point> _pathPoints = [];
   List<DiscoveredEventArgs> _discoveredDevices = [];
   bool _isScanning = false;
+  bool _followMode = false; // Toggle for auto-follow
+  bool _usingPhoneGPS = false; // Fallback flag
   StreamSubscription<DiscoveredEventArgs>? _discoverySubscription;
   StreamSubscription<GATTCharacteristicNotifiedEventArgs>? _notificationSubscription;
 
   // Assume Nordic UART Service UUIDs for ESP32 serial-like communication
   final UUID _serviceUUID = UUID.fromString('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
   final UUID _rxUUID = UUID.fromString('6e400003-b5a3-f393-e0a9-e50e24dcca9e'); // Notify characteristic
+  static const double _distanceThreshold = 10.0; // Meters for significant change
 
   @override
   void initState() {
     super.initState();
-    _latitude = widget.center.coordinates.lat.toString();
-    _longitude = widget.center.coordinates.lng.toString();
+    _latitude = widget.center.coordinates.lat.toDouble();
+    _longitude = widget.center.coordinates.lng.toDouble();
+    _prevLat = _latitude;
+    _prevLng = _longitude;
+    _pathPoints.add(mapbox.Point(coordinates: mapbox.Position(_longitude, _latitude)));
     _initBluetooth();
-    _timer = Timer.periodic(const Duration(seconds: 10), (timer) {
-      _updateCamera();
-    });
+    _initLocationService();
   }
 
   Future<void> _initBluetooth() async {
@@ -252,6 +264,7 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
             const SnackBar(content: Text('Bluetooth and location permissions are required')),
           );
         }
+        _usingPhoneGPS = true; // Fallback to phone GPS
         return;
       }
 
@@ -262,6 +275,7 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
             const SnackBar(content: Text('Bluetooth is not enabled')),
           );
         }
+        _usingPhoneGPS = true; // Fallback
       }
     } catch (e) {
       if (mounted) {
@@ -269,22 +283,68 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
           SnackBar(content: Text('Bluetooth initialization failed: $e')),
         );
       }
+      _usingPhoneGPS = true; // Fallback
     }
   }
 
-  void _updateCamera() {
-    if (_mapboxMap != null) {
-      try {
-        final lat = double.parse(_latitude);
-        final lng = double.parse(_longitude);
-        _mapboxMap?.setCamera(mapbox.CameraOptions(
-          center: mapbox.Point(coordinates: mapbox.Position(lng, lat)),
-          zoom: 10.0,
-        ));
-        _addOrUpdateLocationMarker(lat, lng);
-      } catch (e) {
-        debugPrint('Invalid coordinates: $e');
+  Future<void> _initLocationService() async {
+    _locationService = loc.Location();
+    bool serviceEnabled = await _locationService!.serviceEnabled();
+    if (!serviceEnabled) {
+      serviceEnabled = await _locationService!.requestService();
+      if (!serviceEnabled) return;
+    }
+
+    var permission = await _locationService!.hasPermission();
+    if (permission == loc.PermissionStatus.denied) {
+      permission = await _locationService!.requestPermission();
+      if (permission != loc.PermissionStatus.granted) return;
+    }
+
+    // Subscribe to location changes for fallback
+    _locationSubscription = _locationService!.onLocationChanged.listen((loc.LocationData locationData) {
+      if (_usingPhoneGPS) {
+        _updatePosition(locationData.latitude!, locationData.longitude!);
       }
+    });
+  }
+
+  void _updatePosition(double newLat, double newLng) {
+    final distance = _calculateDistance(_prevLat, _prevLng, newLat, newLng);
+    if (distance > _distanceThreshold) {
+      setState(() {
+        _latitude = newLat;
+        _longitude = newLng;
+        _prevLat = newLat;
+        _prevLng = newLng;
+        _pathPoints.add(mapbox.Point(coordinates: mapbox.Position(newLng, newLat)));
+        _updatePath();
+        if (_followMode) {
+          _smoothUpdateCamera(newLat, newLng);
+        }
+      });
+    }
+  }
+
+  double _calculateDistance(double lat1, double lon1, double lat2, double lon2) {
+    const R = 6371000.0; // Earth radius in meters
+    final dLat = (lat2 - lat1) * pi / 180.0;
+    final dLon = (lon2 - lon1) * pi / 180.0;
+    final a = sin(dLat / 2) * sin(dLat / 2) +
+        cos(lat1 * pi / 180.0) * cos(lat2 * pi / 180.0) * sin(dLon / 2) * sin(dLon / 2);
+    final c = 2 * atan2(sqrt(a), sqrt(1 - a));
+    return R * c;
+  }
+
+  Future<void> _smoothUpdateCamera(double lat, double lng) async {
+    if (_mapboxMap != null) {
+      final currentCamera = await _mapboxMap!.getCameraState();
+      await _mapboxMap!.easeTo(mapbox.CameraOptions(
+        center: mapbox.Point(coordinates: mapbox.Position(lng, lat)),
+        zoom: currentCamera.zoom, // Preserve zoom
+        bearing: currentCamera.bearing, // Preserve bearing
+        pitch: currentCamera.pitch, // Preserve pitch
+      ), mapbox.MapAnimationOptions(duration: 500)); // Smooth animation
     }
   }
 
@@ -296,15 +356,31 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
     if (_locationAnnotation == null) {
       final options = mapbox.CircleAnnotationOptions(
         geometry: point,
-        circleColor: 0xFFFF0000, // Red
-        circleRadius: 10.0,
-        circleStrokeColor: 0xFFFFFFFF, // White
+        circleColor: 0xFF0000FF, // Blue for distinct current location
+        circleRadius: 12.0,
+        circleStrokeColor: 0xFFFFFFFF, // White stroke
         circleStrokeWidth: 2.0,
       );
       _locationAnnotation = await _annotationManager?.create(options);
     } else {
       _locationAnnotation?.geometry = point;
       await _annotationManager?.update(_locationAnnotation!);
+    }
+  }
+
+  Future<void> _updatePath() async {
+    if (_polylineManager == null) return;
+
+    if (_pathAnnotation == null) {
+      final options = mapbox.PolylineAnnotationOptions(
+        geometry: mapbox.LineString(coordinates: _pathPoints.map((p) => p.coordinates).toList()),
+        lineColor: 0xFF0000FF, // Blue line for path
+        lineWidth: 4.0,
+      );
+      _pathAnnotation = await _polylineManager?.create(options);
+    } else {
+      _pathAnnotation?.geometry = mapbox.LineString(coordinates: _pathPoints.map((p) => p.coordinates).toList());
+      await _polylineManager?.update(_pathAnnotation!);
     }
   }
 
@@ -387,6 +463,7 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
     try {
       await _centralManager!.connect(peripheral);
       _connectedPeripheral = peripheral;
+      _usingPhoneGPS = false; // Switch to ESP32 GPS
 
       // Discover services
       final services = await _centralManager!.discoverGATT(peripheral);
@@ -414,11 +491,8 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
             if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
               throw RangeError('GPS coordinates out of valid range');
             }
-            setState(() {
-              _latitude = coords[0];
-              _longitude = coords[1];
-              _updateCamera();
-            });
+            _updatePosition(lat, lng);
+            _addOrUpdateLocationMarker(lat, lng);
           } catch (e) {
             debugPrint('Invalid GPS data: $e');
           }
@@ -431,12 +505,22 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
         );
       }
     } catch (e) {
+      _usingPhoneGPS = true; // Fallback to phone GPS on failure
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Connection failed: $e')),
+          SnackBar(content: Text('Connection failed: $e. Using phone GPS as fallback.')),
         );
       }
     }
+  }
+
+  void _toggleFollowMode() {
+    setState(() {
+      _followMode = !_followMode;
+      if (_followMode) {
+        _smoothUpdateCamera(_latitude, _longitude);
+      }
+    });
   }
 
   @override
@@ -453,17 +537,28 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
           onMapCreated: (mapboxMap) async {
             _mapboxMap = mapboxMap;
             _annotationManager = await mapboxMap.annotations.createCircleAnnotationManager();
-            _updateCamera();
+            _polylineManager = await mapboxMap.annotations.createPolylineAnnotationManager();
+            _addOrUpdateLocationMarker(_latitude, _longitude);
+            _updatePath();
           },
         ),
         Positioned(
           bottom: 16,
           right: 16,
-          child: FloatingActionButton(
-            onPressed: _isScanning ? null : _scanForDevices,
-            child: _isScanning
-                ? const CircularProgressIndicator(color: Colors.white)
-                : const Icon(Icons.bluetooth),
+          child: Column(
+            children: [
+              FloatingActionButton(
+                onPressed: _isScanning ? null : _scanForDevices,
+                child: _isScanning
+                    ? const CircularProgressIndicator(color: Colors.white)
+                    : const Icon(Icons.bluetooth),
+              ),
+              const SizedBox(height: 8),
+              FloatingActionButton(
+                onPressed: _toggleFollowMode,
+                child: Icon(_followMode ? Icons.location_off : Icons.location_on),
+              ),
+            ],
           ),
         ),
       ],
@@ -472,7 +567,7 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
 
   @override
   void dispose() {
-    _timer?.cancel();
+    _locationSubscription?.cancel();
     _discoverySubscription?.cancel();
     _notificationSubscription?.cancel();
     if (_connectedPeripheral != null && _centralManager != null) {
@@ -481,7 +576,11 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
     if (_locationAnnotation != null) {
       _annotationManager?.delete(_locationAnnotation!);
     }
+    if (_pathAnnotation != null) {
+      _polylineManager?.delete(_pathAnnotation!);
+    }
     _annotationManager?.deleteAll();
+    _polylineManager?.deleteAll();
     super.dispose();
   }
 }
