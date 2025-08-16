@@ -1,12 +1,8 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart' as mapbox;
-import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
-import 'package:permission_handler/permission_handler.dart';
-import 'package:location/location.dart' as loc; // Add to pubspec.yaml: location: ^5.0.3
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -41,9 +37,12 @@ class ErrorApp extends StatelessWidget {
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      title: 'Offline Hiking Map',
+      theme: ThemeData(primarySwatch: Colors.blue, useMaterial3: true),
       home: const HikingMapApp(),
     );
   }
@@ -51,6 +50,7 @@ class MyApp extends StatelessWidget {
 
 class HikingMapApp extends StatefulWidget {
   const HikingMapApp({super.key});
+
   @override
   State createState() => _HikingMapAppState();
 }
@@ -100,13 +100,13 @@ class _HikingMapAppState extends State<HikingMapApp> {
     _initOfflineMap();
   }
 
-  _initOfflineMap() async {
+  Future<void> _initOfflineMap() async {
     _offlineManager = await mapbox.OfflineManager.create();
     _tileStore = await mapbox.TileStore.createDefault();
     debugPrint('Offline map resources initialized');
   }
 
-  _downloadMapArea(String areaKey) async {
+  Future<void> _downloadMapArea(String areaKey) async {
     if (!mounted) return;
     final area = _hikingAreas[areaKey]!;
     final tileRegionId = '$areaKey-tile-region';
@@ -192,16 +192,12 @@ class _HikingMapAppState extends State<HikingMapApp> {
       ),
     );
   }
-
-  @override
-  void dispose() {
-    super.dispose();
-  }
 }
 
 class OfflineMapWidget extends StatefulWidget {
   final String areaKey;
   final mapbox.Point center;
+
   const OfflineMapWidget({super.key, required this.areaKey, required this.center});
 
   @override
@@ -214,25 +210,45 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
   mapbox.CircleAnnotation? _locationAnnotation;
   mapbox.PolylineAnnotationManager? _polylineManager;
   mapbox.PolylineAnnotation? _pathAnnotation;
-  CentralManager? _centralManager;
-  Peripheral? _connectedPeripheral;
-  loc.Location? _locationService;
-  StreamSubscription<loc.LocationData>? _locationSubscription;
   double _latitude = 0.0;
   double _longitude = 0.0;
   double _prevLat = 0.0;
   double _prevLng = 0.0;
   List<mapbox.Point> _pathPoints = [];
-  List<DiscoveredEventArgs> _discoveredDevices = [];
-  bool _isScanning = false;
-  bool _followMode = false; // Toggle for auto-follow
-  bool _usingPhoneGPS = false; // Fallback flag
-  StreamSubscription<DiscoveredEventArgs>? _discoverySubscription;
-  StreamSubscription<GATTCharacteristicNotifiedEventArgs>? _notificationSubscription;
+  bool _followMode = false;
 
-  // Assume Nordic UART Service UUIDs for ESP32 serial-like communication
-  final UUID _serviceUUID = UUID.fromString('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
-  final UUID _rxUUID = UUID.fromString('6e400003-b5a3-f393-e0a9-e50e24dcca9e'); // Notify characteristic
+  // Simulated stores with dummy data
+  final Map<String, List<String>> _stores = {
+    'inbox': [
+      '1:Hello Akila, how are you?',
+      '3:Ah yes, isn\'t React Native easy to work with?',
+      '5:Is that why you switched to Flutter?',
+      '6:Amazinggggggggggg.........'
+    ],
+    'sendbox': [
+      '2:I\'m doing well Raju, these days I\'m building a Flutter app.',
+      '4:Ah, I know, but I couldn\'t connect Mapbox.',
+      '7:Good Night!'
+    ],
+    'gps': [
+      '1.22345,27.332233',
+      '2.22345,27.332233',
+      '3.22345,27.332233',
+      '4.22345,27.332233',
+      '5.22345,27.332233',
+      '6.22345,27.332233'
+    ],
+  };
+  final Map<String, int> _sizes = {
+    'inbox': 4,
+    'sendbox': 3,
+    'gps': 6
+  };
+  Map<String, int> _selectedIndices = {'inbox': 0, 'sendbox': 0, 'gps': 0};
+  Map<String, String> _data = {'inbox': '', 'sendbox': '', 'gps': ''};
+  Map<String, String> _notifications = {'inbox': '', 'sendbox': '', 'gps': ''};
+  String _status = 'Ready';
+
   static const double _distanceThreshold = 10.0; // Meters for significant change
 
   @override
@@ -243,75 +259,74 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
     _prevLat = _latitude;
     _prevLng = _longitude;
     _pathPoints.add(mapbox.Point(coordinates: mapbox.Position(_longitude, _latitude)));
-    _initBluetooth();
-    _initLocationService();
+    // Plot all initial GPS coordinates
+    _plotAllGpsCoordinates();
   }
 
-  Future<void> _initBluetooth() async {
-    _centralManager = CentralManager();
-    try {
-      // Request permissions
-      final permissions = await [
-        Permission.bluetooth,
-        Permission.bluetoothScan,
-        Permission.bluetoothConnect,
-        Permission.location,
-      ].request();
+  void _plotAllGpsCoordinates() {
+    for (int i = 0; i < _stores['gps']!.length; i++) {
+      _selectedIndices['gps'] = i;
+      _readData('gps', initialPlot: true);
+    }
+    // Set to last coordinate for display
+    _selectedIndices['gps'] = _stores['gps']!.length - 1;
+    _readData('gps');
+  }
 
-      if (!permissions.values.every((status) => status.isGranted)) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Bluetooth and location permissions are required')),
-          );
+  void _readData(String store, {bool initialPlot = false}) {
+    final index = _selectedIndices[store]!;
+    if (index >= 0 && index < _stores[store]!.length) {
+      final dataStr = _stores[store]![index];
+      setState(() {
+        _data[store] = dataStr;
+        _status = 'Read $store data: $dataStr';
+      });
+      if (store == 'gps') {
+        try {
+          var coords = dataStr.split(",");
+          if (coords.length != 2) throw FormatException('Invalid GPS data format');
+          final lat = double.parse(coords[0]);
+          final lng = double.parse(coords[1]);
+          if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+            throw RangeError('GPS coordinates out of valid range');
+          }
+          if (initialPlot || index == _stores['gps']!.length - 1) {
+            _updatePosition(lat, lng);
+            _addOrUpdateLocationMarker(lat, lng);
+          }
+        } catch (e) {
+          debugPrint('Invalid GPS data: $e');
+          setState(() {
+            _status = 'Invalid GPS data: $e';
+          });
         }
-        _usingPhoneGPS = true; // Fallback to phone GPS
-        return;
       }
-
-      final state = _centralManager!.state;
-      if (state != BluetoothLowEnergyState.poweredOn) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Bluetooth is not enabled')),
-          );
-        }
-        _usingPhoneGPS = true; // Fallback
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Bluetooth initialization failed: $e')),
-        );
-      }
-      _usingPhoneGPS = true; // Fallback
+    } else {
+      setState(() {
+        _data[store] = '';
+        _status = 'Invalid $store index: $index';
+      });
     }
   }
 
-  Future<void> _initLocationService() async {
-    _locationService = loc.Location();
-    bool serviceEnabled = await _locationService!.serviceEnabled();
-    if (!serviceEnabled) {
-      serviceEnabled = await _locationService!.requestService();
-      if (!serviceEnabled) return;
-    }
-
-    var permission = await _locationService!.hasPermission();
-    if (permission == loc.PermissionStatus.denied) {
-      permission = await _locationService!.requestPermission();
-      if (permission != loc.PermissionStatus.granted) return;
-    }
-
-    // Subscribe to location changes for fallback
-    _locationSubscription = _locationService!.onLocationChanged.listen((loc.LocationData locationData) {
-      if (_usingPhoneGPS) {
-        _updatePosition(locationData.latitude!, locationData.longitude!);
-      }
+  void _simulateNotification(String store) {
+    if (store != 'gps') return; // Only simulate for gps
+    // Simulate adding a new coordinate dynamically
+    final newIndex = _stores['gps']!.length + 1;
+    final newCoord = '${newIndex}.22345,27.332233';
+    setState(() {
+      _stores['gps']!.add(newCoord);
+      _sizes['gps'] = _stores['gps']!.length;
+      _selectedIndices[store] = _stores['gps']!.length - 1;
+      _notifications[store] = 'Simulated index: ${_selectedIndices[store]}';
+      _status = 'Simulated $store notification for index: ${_selectedIndices[store]}';
     });
+    _readData(store);
   }
 
   void _updatePosition(double newLat, double newLng) {
     final distance = _calculateDistance(_prevLat, _prevLng, newLat, newLng);
-    if (distance > _distanceThreshold) {
+    if (distance > _distanceThreshold || _pathPoints.length == 1) {
       setState(() {
         _latitude = newLat;
         _longitude = newLng;
@@ -339,26 +354,27 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
   Future<void> _smoothUpdateCamera(double lat, double lng) async {
     if (_mapboxMap != null) {
       final currentCamera = await _mapboxMap!.getCameraState();
-      await _mapboxMap!.easeTo(mapbox.CameraOptions(
-        center: mapbox.Point(coordinates: mapbox.Position(lng, lat)),
-        zoom: currentCamera.zoom, // Preserve zoom
-        bearing: currentCamera.bearing, // Preserve bearing
-        pitch: currentCamera.pitch, // Preserve pitch
-      ), mapbox.MapAnimationOptions(duration: 500)); // Smooth animation
+      await _mapboxMap!.easeTo(
+        mapbox.CameraOptions(
+          center: mapbox.Point(coordinates: mapbox.Position(lng, lat)),
+          zoom: currentCamera.zoom,
+          bearing: currentCamera.bearing,
+          pitch: currentCamera.pitch,
+        ),
+        mapbox.MapAnimationOptions(duration: 500),
+      );
     }
   }
 
   Future<void> _addOrUpdateLocationMarker(double lat, double lng) async {
     if (_annotationManager == null) return;
-
     final point = mapbox.Point(coordinates: mapbox.Position(lng, lat));
-
     if (_locationAnnotation == null) {
       final options = mapbox.CircleAnnotationOptions(
         geometry: point,
-        circleColor: 0xFF0000FF, // Blue for distinct current location
+        circleColor: 0xFF0000FF,
         circleRadius: 12.0,
-        circleStrokeColor: 0xFFFFFFFF, // White stroke
+        circleStrokeColor: 0xFFFFFFFF,
         circleStrokeWidth: 2.0,
       );
       _locationAnnotation = await _annotationManager?.create(options);
@@ -370,147 +386,16 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
 
   Future<void> _updatePath() async {
     if (_polylineManager == null) return;
-
     if (_pathAnnotation == null) {
       final options = mapbox.PolylineAnnotationOptions(
         geometry: mapbox.LineString(coordinates: _pathPoints.map((p) => p.coordinates).toList()),
-        lineColor: 0xFF0000FF, // Blue line for path
+        lineColor: 0xFF0000FF,
         lineWidth: 4.0,
       );
       _pathAnnotation = await _polylineManager?.create(options);
     } else {
       _pathAnnotation?.geometry = mapbox.LineString(coordinates: _pathPoints.map((p) => p.coordinates).toList());
       await _polylineManager?.update(_pathAnnotation!);
-    }
-  }
-
-  Future<void> _scanForDevices() async {
-    if (_centralManager == null || _isScanning) return;
-
-    setState(() {
-      _isScanning = true;
-      _discoveredDevices = [];
-    });
-
-    try {
-      _discoverySubscription = _centralManager!.discovered.listen((DiscoveredEventArgs event) {
-        if (!_discoveredDevices.any((d) => d.peripheral.uuid == event.peripheral.uuid)) {
-          setState(() {
-            _discoveredDevices.add(event);
-          });
-        }
-      });
-
-      await _centralManager!.startDiscovery();
-      await Future.delayed(const Duration(seconds: 10)); // Scan for 10 seconds
-      await _centralManager!.stopDiscovery();
-
-      setState(() {
-        _isScanning = false;
-      });
-
-      if (_discoveredDevices.isNotEmpty) {
-        _showDeviceSelectionDialog();
-      } else {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('No devices found')),
-          );
-        }
-      }
-    } catch (e) {
-      setState(() {
-        _isScanning = false;
-      });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Scan failed: $e')),
-        );
-      }
-    }
-  }
-
-  void _showDeviceSelectionDialog() {
-    showDialog(
-      context: context,
-      builder: (context) {
-        return AlertDialog(
-          title: const Text('Select Bluetooth Device'),
-          content: SizedBox(
-            width: double.maxFinite,
-            child: ListView.builder(
-              shrinkWrap: true,
-              itemCount: _discoveredDevices.length,
-              itemBuilder: (context, index) {
-                final event = _discoveredDevices[index];
-                return ListTile(
-                  title: Text(event.advertisement.name ?? 'Unknown'),
-                  subtitle: Text(event.peripheral.uuid.toString()),
-                  onTap: () {
-                    Navigator.pop(context);
-                    _connectToDevice(event.peripheral);
-                  },
-                );
-              },
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Future<void> _connectToDevice(Peripheral peripheral) async {
-    try {
-      await _centralManager!.connect(peripheral);
-      _connectedPeripheral = peripheral;
-      _usingPhoneGPS = false; // Switch to ESP32 GPS
-
-      // Discover services
-      final services = await _centralManager!.discoverGATT(peripheral);
-      final service = services.firstWhere(
-        (s) => s.uuid == _serviceUUID,
-        orElse: () => throw Exception('Service not found'),
-      );
-      final characteristic = service.characteristics.firstWhere(
-        (c) => c.uuid == _rxUUID,
-        orElse: () => throw Exception('Characteristic not found'),
-      );
-
-      // Set up notifications
-      await _centralManager!.setCharacteristicNotifyState(peripheral, characteristic, state: true);
-      _notificationSubscription = _centralManager!.characteristicNotified.listen((GATTCharacteristicNotifiedEventArgs event) {
-        if (event.characteristic.uuid == _rxUUID) {
-          try {
-            String received = utf8.decode(event.value).trim();
-            var coords = received.split(",");
-            if (coords.length != 2) {
-              throw FormatException('Invalid GPS data format');
-            }
-            final lat = double.parse(coords[0]);
-            final lng = double.parse(coords[1]);
-            if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-              throw RangeError('GPS coordinates out of valid range');
-            }
-            _updatePosition(lat, lng);
-            _addOrUpdateLocationMarker(lat, lng);
-          } catch (e) {
-            debugPrint('Invalid GPS data: $e');
-          }
-        }
-      });
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Connected to ${peripheral.uuid}')),
-        );
-      }
-    } catch (e) {
-      _usingPhoneGPS = true; // Fallback to phone GPS on failure
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Connection failed: $e. Using phone GPS as fallback.')),
-        );
-      }
     }
   }
 
@@ -521,6 +406,128 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
         _smoothUpdateCamera(_latitude, _longitude);
       }
     });
+  }
+
+  void _showMessagesWindow() {
+    // Combine inbox and sendbox messages with their indices
+    List<Map<String, dynamic>> messages = [];
+    _stores['inbox']!.asMap().forEach((index, message) {
+      messages.add({
+        'index': int.parse(message.split(':')[0]),
+        'text': message.substring(message.indexOf(':') + 1),
+        'isInbox': true
+      });
+    });
+    _stores['sendbox']!.asMap().forEach((index, message) {
+      messages.add({
+        'index': int.parse(message.split(':')[0]),
+        'text': message.substring(message.indexOf(':') + 1),
+        'isInbox': false
+      });
+    });
+    // Sort by index for chronological order
+    messages.sort((a, b) => a['index'].compareTo(b['index']));
+
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Messages and GPS'),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: 400,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Current GPS: $_latitude, $_longitude',
+                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 8),
+                Expanded(
+                  child: ListView.builder(
+                    itemCount: messages.length,
+                    itemBuilder: (context, index) {
+                      final message = messages[index];
+                      return Align(
+                        alignment: message['isInbox']
+                            ? Alignment.centerLeft
+                            : Alignment.centerRight,
+                        child: Container(
+                          margin: const EdgeInsets.symmetric(
+                              vertical: 4, horizontal: 8),
+                          padding: const EdgeInsets.all(10),
+                          constraints: BoxConstraints(
+                            maxWidth: MediaQuery.of(context).size.width * 0.6,
+                          ),
+                          decoration: BoxDecoration(
+                            color: message['isInbox']
+                                ? Colors.grey[300]
+                                : Colors.blue[200],
+                            borderRadius: BorderRadius.circular(12),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.1),
+                                blurRadius: 4,
+                                offset: const Offset(2, 2),
+                              ),
+                            ],
+                          ),
+                          child: Text(
+                            message['text'],
+                            style: const TextStyle(fontSize: 14),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        decoration: const InputDecoration(
+                          labelText: 'Select gps Index',
+                          border: OutlineInputBorder(),
+                        ),
+                        keyboardType: TextInputType.number,
+                        onSubmitted: (value) {
+                          int? index = int.tryParse(value);
+                          if (index != null && index >= 0 && index < _sizes['gps']!) {
+                            setState(() {
+                              _selectedIndices['gps'] = index;
+                              _status = 'Selected gps index: $index';
+                            });
+                            _readData('gps');
+                          }
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    ElevatedButton(
+                      onPressed: () => _readData('gps'),
+                      child: const Text('Read Data'),
+                    ),
+                    const SizedBox(width: 8),
+                    ElevatedButton(
+                      onPressed: () => _simulateNotification('gps'),
+                      child: const Text('Simulate Notification'),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Close'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   @override
@@ -548,10 +555,8 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
           child: Column(
             children: [
               FloatingActionButton(
-                onPressed: _isScanning ? null : _scanForDevices,
-                child: _isScanning
-                    ? const CircularProgressIndicator(color: Colors.white)
-                    : const Icon(Icons.bluetooth),
+                onPressed: _showMessagesWindow,
+                child: const Icon(Icons.add),
               ),
               const SizedBox(height: 8),
               FloatingActionButton(
@@ -567,12 +572,6 @@ class _OfflineMapWidgetState extends State<OfflineMapWidget> {
 
   @override
   void dispose() {
-    _locationSubscription?.cancel();
-    _discoverySubscription?.cancel();
-    _notificationSubscription?.cancel();
-    if (_connectedPeripheral != null && _centralManager != null) {
-      _centralManager!.disconnect(_connectedPeripheral!);
-    }
     if (_locationAnnotation != null) {
       _annotationManager?.delete(_locationAnnotation!);
     }
